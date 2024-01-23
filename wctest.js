@@ -2,21 +2,42 @@ const { MongoClient } = require("mongodb");
 const { Worker, isMainThread, workerData, parentPort } = require('worker_threads');
 const bson = require('bson');
 const rg = require('./random_generation');
+const stringify = bson.EJSON.stringify;
+
+// getCircularReplacer taken from MDN
+const getCircularReplacer = () => {
+  const seen = new WeakSet();
+  return (key, value) => {
+    if (typeof value === "object" && value !== null) {
+      if (seen.has(value)) {
+        return;
+      }
+      seen.add(value);
+    }
+    return value;
+  };
+};
 
 // Configuration section
 
 // 0 = info only
+// 1 = (currently unused)
 // 2 = debug
 const loglevel = 0;
+
+// delay ietween tests in ms
+const testdelay = 5000;
+
 // cluster and credentials
 const srvhost  = "cluster0.k8hsw.mongodb.net";
 const username = "username";
-const password = "password";
+const password = "word of passing";
 
 // URIs to be tested
 const uriBase = `mongodb+srv://${username}:${password}@${srvhost}/test?readPreference=secondaryPreferred&readPreferenceTags=region:US_CENTRAL`;
 const uris = [
  `${uriBase}&w=3`,
+ `${uriBase}&w=twoRegions`,
  `${uriBase}&w=threeRegions`
 ];
 
@@ -62,7 +83,7 @@ async function monitor(Idx) {
     let lastAck = null;
     let expecting = null;
     let resumeToken = null;
-    let changestream = null;
+    let oplogCursor = null;
 
     function info(msg) {
         parentPort.postMessage({tag:"info",region:region, msg:msg});
@@ -72,12 +93,20 @@ async function monitor(Idx) {
         parentPort.postMessage({tag:"debug", region:region, msg:msg});
     }
 
+    async function fetchTip() {
+            let tipcursor = await local_client.db("local").collection("oplog.rs").find({}).sort({"$natural":-1}).limit(1);
+            let tip = await tipcursor.next();
+            debug("found oplog tip: " + stringify(tip));
+            if (!tipcursor.closed) tipcursor.close();
+            return(tip);
+    }
+
     info("Worker starting")
 
     const local_client = new MongoClient(uri_left + host + uri_right);
     
     parentPort.on('message', async (message) => {
-        debug("Received: " + bson.EJSON.stringify(message));
+        debug("Received: " + stringify(message));
         message.msg = bson.EJSON.parse(message.msg);
     
         switch (message.tag) {
@@ -85,9 +114,9 @@ async function monitor(Idx) {
                 running = false;
                 debug("Worker stopping");
 
-                if (changestream) {
-                    if (!changestream.closed) {
-                        await changestream.close();
+                if (oplogCursor) {
+                    if (!oplogCursor.closed) {
+                        await oplogCursor.close();
                     }
                 }
                 await local_client.close();
@@ -100,44 +129,52 @@ async function monitor(Idx) {
             case "sent":
                 expecting = message.msg;
                 break;
+            case "fetch_tip":
+                let tipdoc = await fetchTip();
+                info(`Oplog tip: ${stringify(tipdoc.ts)} (${stringify(tipdoc.o2)})`);
+                break;
             default:
                 info(`Unknown message type ${message.tag}`)
         }
     });
 
-    function stream() {
-        let matchdoc = {"operationType":"insert"};
-        matchdoc["fullDocument."+doctag] = true;
-        const pipeline = [{"$match":matchdoc}];
-        let options = {};
-        if (resumeToken) {
-            debug("Resuming changestream");
-            options.resumeAfter = resumeToken;
-        } else {
-            debug("Starting change stream");
+    async function stream() {
+        if (!resumeToken) {
+            let tip = await fetchTip();
+            resumeToken = tip.ts;
         }
-        changestream = local_client.db(database).collection(collection).watch(pipeline, options);
 
-        changestream.on('change', (doc) => {
-            if (!changestream.closed) {
-                info(`Received ${doc.documentKey._id} while expecting ${expecting} and last ack ${lastAck}`);
-                resumeToken = doc._id;
+        let matchdoc = {
+            ts: {"$gt": resumeToken},
+            op: "i",
+            ns: `${database}.${collection}`,
+        };
+        matchdoc[`o.${doctag}`] = {'$exists':true};
+
+        let options = {tailable: true};
+
+        oplogCursor = local_client.db("local").collection("oplog.rs").find(matchdoc, options);
+
+
+        oplogCursor.stream().on('data', (doc) => {
+            if (!oplogCursor.closed) {
+                info(`Received ${doc.o._id} while expecting ${expecting} and last ack ${lastAck}`);
+                resumeToken = doc.ts;
             }
         });
 
-        changestream.on('close', () => {
-            debug("Change stream closed");
-            delete changestream;
-            changestream = "closed";
+        oplogCursor.on('close', () => {
+            debug("Oplog cursor stream closed");
+            delete oplogCursor;
         });
 
     }
 
-    function checkStream() {
+    async function checkStream() {
         if(running) {
-            if (!changestream) { 
-                stream();
-                debug(`changestream:${changestream}`);
+            if (!oplogCursor) { 
+                await stream();
+                debug(`oplogCursor:${JSON.stringify(oplogCursor,getCircularReplacer())}`);
                 parentPort.postMessage({tag:"ready",region:region, msg:""});     
             }
             setTimeout(checkStream, 50);
@@ -153,10 +190,10 @@ async function main() {
         const workers = {};
         
         async function tellWorkers(tag, msg) {
-            let msgobj = Object.assign({},{tag, msg:bson.EJSON.stringify(msg)});
-            debug("Broadcast: "+bson.EJSON.stringify(msgobj));
+            let msgobj = Object.assign({},{tag, msg:stringify(msg)});
+            debug("Broadcast: "+stringify(msgobj));
             for (w in workers) {
-                workers[w].postMessage({tag:tag, msg:bson.EJSON.stringify(msg)});
+                workers[w].postMessage({tag:tag, msg:stringify(msg)});
             }
         }
 
@@ -180,25 +217,51 @@ async function main() {
                 return(coll.insertMany(docs, opts))
             }
 
-            async function sendTaggedInsert(doc, opts) { 
+            async function _sendTaggedInsert(doc, opts) { 
                 if (!doc._id) {
                     doc = Object.assign({_id: new bson.ObjectId()}, doc);
                 }
-                debug(`Tagging ${bson.EJSON.stringify(doc)}`)
+                debug(`Tagging ${stringify(doc)}`)
                 doc[doctag] = true;
 
                 // tell the workers which document is coming
                 tellWorkers("sent", doc._id);
-                info(`Insert ${doc._id} with options ${bson.EJSON.stringify(opts)}`);
+                info(`Insert ${doc._id} with options ${stringify(opts)}`);
                 result = await coll.insertOne(doc, opts);
-                debug("Result:" + bson.EJSON.stringify(result));
-                tellWorkers("ack", doc._id);
+                debug("Result:" + stringify(result));
+
+                let tipcursor = await client.db("local").collection("oplog.rs").find({}).sort({"$natural":-1}).limit(1);
+                let tip = await tipcursor.next();
+                if (!tipcursor.closed) tipcursor.close();
+                info(`Primary oplog tip: ${stringify(tip.ts)} (${stringify(tip.o2)})`);
+
+                tellWorkers("fetch_tip","");
                 info(`Insert for ${doc._id} acknowledged`);
+                tellWorkers("ack", doc._id);
             }
+
+            async function sendTaggedInsert(doc, opts) {
+                return new Promise((resolve,reject) => {
+                    setTimeout(() => {
+                        resolve(_sendTaggedInsert(doc, opts));
+                    }, testdelay);
+                })
+            }
+
+            let status = await client.db("admin").command({replSetGetStatus:1});
+            debug("replSetGetStatus: "+stringify(status));
+
+            // visual separator between tests
+            info("************************************************");
+
+            let primary = status.members.filter(m=>m.state == 1).map(m=>m.name).join("");
+            info("Current Primary: " +stringify(primary));
 
             info(`Begin test with uri: ${uri}`);
 
             await sendTaggedInsert({type:"first",dt:new Date()});
+            
+            await sendTaggedInsert({type:"second",dt:new Date()},{writeConcern:{w:"twoRegions"}});
             
             await sendTaggedInsert({type:"second",dt:new Date()},{writeConcern:{w:"threeRegions"}});
 
@@ -212,24 +275,33 @@ async function main() {
                 })
             };
 
-            await sendInserts(docs);
+            info("Send 1000 docs with w:1 to cause a bit of lag");
+            await sendInserts(docs, {w:1});
 
             await sendTaggedInsert({type:"third",dt:new Date()},{});
+            await sendTaggedInsert({type:"fourth",dt:new Date()},{writeConcern:{w:"twoRegions"}});
             await sendTaggedInsert({type:"fourth",dt:new Date()},{writeConcern:{w:"threeRegions"}});
         }
         
-        async function testUris() {
+        async function testUris(remain) {
+            if (!remain) {
+                remain = uris
+            }
 
-            for(let i=0;i<uris.length;i++){
-                await test(uris[i]);
-                debug(`Complete ${uris[i]}`)
-            };    
+            if (remain.length > 0){
+                let uri = remain.shift();
+                setTimeout(async function () {
+                    await test(uri); 
+                    testUris(remain);
+                }, testdelay);
+            } else {
 
-            setTimeout( function() {
-                tellWorkers("stop", "Test Complete");
-                waitForWorkers()},
-                5000
-            );
+                setTimeout( function() {
+                    tellWorkers("stop", "Test Complete");
+                    waitForWorkers()},
+                    testdelay
+                );
+            }
         } 
 
         let started = {};
@@ -257,7 +329,7 @@ async function main() {
                         if (Object.keys(started).length == hosts.length) testUris();
                         break;
                     default:
-                        info(bson.EJSON.stringify(message));
+                        info(stringify(message));
                 }
             });
         }
