@@ -214,7 +214,8 @@ async function main() {
 
             await sendInserts(docs);
 
-            await sendTaggedInsert({type:"third",dt:new Date()},{writeConcern:{w:"threeRegions"}});
+            await sendTaggedInsert({type:"third",dt:new Date()},{});
+            await sendTaggedInsert({type:"fourth",dt:new Date()},{writeConcern:{w:"threeRegions"}});
         }
         
         async function testUris() {
