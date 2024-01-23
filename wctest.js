@@ -22,7 +22,7 @@ const uris = [
 
 // URI and per-host configs to connect to replica set members directly
 const uri_left  = `mongodb://${username}:${password}@`;
-const uri_right = "/test?tls=true&readPreference=secondary&authSource=admin";
+const uri_right = "/test?tls=true&readPreference=secondary&authSource=admin&directConnection=true";
 const hosts = [
     {"region":"east1",    "host":"cluster0-shard-00-01.k8hsw.mongodb.net:27017"},
     {"region":"east2",    "host":"cluster0-shard-00-02.k8hsw.mongodb.net:27017"},
