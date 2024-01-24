@@ -31,7 +31,7 @@ const testdelay = 5000;
 // cluster and credentials
 const srvhost  = "cluster0.k8hsw.mongodb.net";
 const username = "username";
-const password = "word of passing";
+const password = "password";
 
 // URIs to be tested
 const uriBase = `mongodb+srv://${username}:${password}@${srvhost}/test?readPreference=secondaryPreferred&readPreferenceTags=region:US_CENTRAL`;
@@ -73,6 +73,11 @@ function debug(message) {
     }
 }
 
+async function delay(promise, delayms) {
+    return new Promise((resolve, reject) => {
+        setTimeout( resolve(promise), delayms);
+    })
+}
 
 // monitor function will be run in a thread for each replica set member monitored
 async function monitor(Idx) {
@@ -124,14 +129,18 @@ async function monitor(Idx) {
                 process.exit(0);
                 break;
             case "ack":
+                let ackdoc = await fetchTip();
+                info(`Oplog tip at ack of ${message.msg}: ${stringify(ackdoc.ts)} (${stringify(ackdoc.o2)})`);
                 lastAck = message.msg;
                 break;
             case "sent":
                 expecting = message.msg;
                 break;
             case "fetch_tip":
-                let tipdoc = await fetchTip();
-                info(`Oplog tip: ${stringify(tipdoc.ts)} (${stringify(tipdoc.o2)})`);
+                if (loglevel >= 2) {
+                    let tipdoc = await fetchTip();
+                    debug(`Oplog tip: ${stringify(tipdoc.ts)} (${stringify(tipdoc.o2)})`);
+                }
                 break;
             default:
                 info(`Unknown message type ${message.tag}`)
@@ -241,11 +250,7 @@ async function main() {
             }
 
             async function sendTaggedInsert(doc, opts) {
-                return new Promise((resolve,reject) => {
-                    setTimeout(() => {
-                        resolve(_sendTaggedInsert(doc, opts));
-                    }, testdelay);
-                })
+                delay(_sendTaggedInsert(doc, opts), testdelay);
             }
 
             let status = await client.db("admin").command({replSetGetStatus:1});
